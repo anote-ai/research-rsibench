@@ -1,0 +1,312 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{natbib}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.17}
+
+\title{RSI-Bench: Measuring Recursive Self-Improvement in AI Systems\\[0.3em]
+\large An open benchmark, taxonomy, and metric suite for improvement trajectories}
+\author{Anote AI Research}
+\date{Draft --- September 2026}
+
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Recursive self-improvement (RSI), where an AI system uses its own outputs and evaluations to make itself better and does so repeatedly, is central to discussions of AI progress, safety and regulation. Yet it has no shared operational definition and no public benchmark. Static leaderboards measure a point; RSI is a slope.
+We introduce \textbf{RSI-Bench}, an open benchmark that measures the \emph{improvement trajectory} $S_0, S_1, \dots, S_T$ of a system that is repeatedly evaluated, shown its results, and allowed to change itself. RSI-Bench contributes:
+(i) an operational definition of RSI as a property of held-out trajectories under a declared \emph{improvement channel} (prompt, memory, weights) and \emph{feedback level} (score, errors, corrections);
+(ii) a metric suite headed by $\eta$, the mean per-iteration held-out gain, together with normalized gain, curve acceleration, a saturating-curve fit, generalisation gap, forgetting, and alignment drift;
+(iii) four discrete, statistically gated \emph{RSI levels}: none, one-shot, sustained and accelerating;
+(iv) a dual capability/alignment track, so that improvement bought by abandoning developer intent is visible; and
+(v) an open, dependency-free harness that runs any API-accessible model and plugs into the Anote Model Leaderboard, turning every Leaderboard dataset into an RSI dataset through score-only feedback.
+We validate the harness against a deterministic reference learner with known learning rules, and show that the metrics recover each built-in behaviour: no learning from scalars, identical curves for information-equivalent channels, forgetting under context eviction, memorisation-only gains, and the collapse from sustained to one-shot improvement when the label budget is unlimited. We release the harness, the task suites and the protocol for a frontier-model sweep.
+\end{abstract}
+
+%-------------------------------------------------------------------------------
+\section{Introduction}
+
+The idea that a sufficiently capable system could improve its own ability to improve dates back at least to \citet{good1965}, and was later formalised in self-referential learners such as the G\"odel machine \citep{schmidhuber2003}. In current practice, large language models (LLMs) already participate in their own improvement at several levels:
+
+\begin{itemize}
+  \item They refine their outputs from feedback \citep{madaan2023selfrefine, shinn2023reflexion}.
+  \item They optimise their own prompts \citep{yang2023opro, fernando2023promptbreeder, khattab2023dspy, yuksekgonul2024textgrad}.
+  \item They generate their own training data and rewards \citep{zelikman2022star, yuan2024selfrewarding}.
+  \item They rewrite the code that scaffolds them \citep{zelikman2023stop, yin2024godelagent, zhang2025dgm}.
+\end{itemize}
+
+Benchmarks for AI R\&D ability \citep{chan2024mlebench, wijk2024rebench} measure whether a model can do the work that improves AI systems.
+
+What is missing is a \emph{common yardstick for the loop itself}. Each self-improvement method is evaluated on its own tasks, with its own feedback, budget and baseline. Most report a before/after pair rather than a trajectory, and many re-test on the very items whose corrections were fed back. As a result we cannot answer basic questions:
+
+\begin{itemize}
+  \item Does model A improve itself faster than model B?
+  \item Does the gain persist over rounds or stop after the first one?
+  \item Is it real generalisation or memorisation of the answer key?
+  \item Does the system stay aligned with its developer's intent while it improves?
+\end{itemize}
+
+These questions matter beyond research. Proposed governance regimes key obligations to capability thresholds. ``The system materially improves itself'' is widely cited as a risk factor, but there is no measurement a regulator or auditor could reference.
+
+\paragraph{Our proposal.} RSI-Bench treats RSI as an empirical property of a trajectory. A system is evaluated at iteration $I=0$. It is shown its results on a \emph{feedback split}, and an \emph{improvement mechanism} changes something: the prompt, an external memory, or the weights. It is then re-evaluated on a disjoint \emph{held-out split}, and the process repeats. The headline number,
+\[
+\eta = \frac{S_T - S_0}{T},
+\]
+is the mean held-out gain per iteration. A system that can ``learn iteratively and repeatedly from the $I=0,1,2,\dots$ tries to keep getting better'' has $\eta > 0$ with sustained gains. A system whose gains \emph{grow} with each round has positive curve acceleration, which is our operational signature of \emph{recursive} improvement.
+
+\paragraph{Contributions.}
+\begin{enumerate}
+  \item A definition and taxonomy (\S\ref{sec:def}) separating improvement \emph{channel} from \emph{feedback level}, with explicit rules about what is admissible.
+  \item A metric suite and RSI levels L0--L3 (\S\ref{sec:metrics}) with statistical gating.
+  \item Task suites that isolate generalisable rules, latent skills, pure memorisation and developer-intent compliance (\S\ref{sec:bench}).
+  \item An open harness integrated with a public model leaderboard (\S\ref{sec:harness}).
+  \item A harness validation study (\S\ref{sec:validation}) and a pre-registered protocol for a frontier-model sweep (\S\ref{sec:protocol}).
+\end{enumerate}
+
+%-------------------------------------------------------------------------------
+\section{Related Work}
+
+\paragraph{Inference-time self-improvement.} Self-Refine \citep{madaan2023selfrefine} iterates generate--critique--revise on single outputs. Reflexion \citep{shinn2023reflexion} stores verbal reflections in an episodic memory across trials. Both report gains on their tasks. RSI-Bench's \texttt{self\_reflection} mechanism is a Reflexion-style baseline applied \emph{across} items rather than within one item, and is scored only on held-out items.
+
+\paragraph{Prompt optimisation.} OPRO \citep{yang2023opro}, Promptbreeder \citep{fernando2023promptbreeder}, DSPy \citep{khattab2023dspy} and TextGrad \citep{yuksekgonul2024textgrad} use LLMs to search over prompts or programs given a score signal. In our taxonomy these are prompt-channel mechanisms. Their outer loop maps directly onto the RSI-Bench runner, and they can be submitted as mechanisms.
+
+\paragraph{Self-training.} STaR \citep{zelikman2022star} fine-tunes on self-generated rationales that lead to correct answers. Self-rewarding language models \citep{yuan2024selfrewarding} use the model as its own judge during iterative DPO. These are weight-channel mechanisms, and their per-iteration results are exactly the trajectories RSI-Bench standardises.
+
+\paragraph{Self-modifying agents.} STOP \citep{zelikman2023stop} improves a scaffolding program using the program itself. G\"odel Agent \citep{yin2024godelagent} and the Darwin G\"odel Machine \citep{zhang2025dgm} let agents rewrite their own code. These systems are the strongest current candidates for L2/L3 behaviour.
+
+\paragraph{AI R\&D benchmarks.} MLE-bench \citep{chan2024mlebench} and RE-Bench \citep{wijk2024rebench} measure whether agents can perform ML engineering and research tasks. They measure an \emph{input} to RSI (the ability to do the work), whereas RSI-Bench measures the \emph{output} (whether the system actually gets better at a fixed task distribution when looped on itself).
+
+\paragraph{Instruction following and intent.} Our alignment track follows IFEval \citep{zhou2023ifeval}, using verifiable format constraints as a minimal, machine-checkable proxy for developer intent. It is designed to be extended with richer developer-intent data.
+
+%-------------------------------------------------------------------------------
+\section{Defining Recursive Self-Improvement}
+\label{sec:def}
+
+\paragraph{Setting.} A \emph{system} is a pair $(M, \sigma)$ of a model $M$ and a state $\sigma$. The state holds instructions, worked examples, notes and score history; for the weight channel it also holds the parameters. A benchmark is a set of tasks with scorers $s(\cdot) \in [0,1]$, split into a feedback split $\mathcal{F}$ and a held-out split $\mathcal{H}$, stratified by suite. Let $F_i$ and $S_i$ be the mean scores of system $(M, \sigma_i)$ on $\mathcal{F}$ and $\mathcal{H}$.
+
+\paragraph{The loop.} For $i = 0,\dots,T-1$:
+\begin{align*}
+  \text{feedback}_i &= \Phi_\ell\big(\mathcal{F}, (M,\sigma_i)\big), \\
+  \sigma_{i+1} &= \mathcal{U}\big(\sigma_i, \text{feedback}_i, M\big),
+\end{align*}
+where $\Phi_\ell$ reveals information at level $\ell$ and $\mathcal{U}$ is the improvement mechanism. Nothing about $\mathcal{H}$ is ever passed to $\mathcal{U}$.
+
+\paragraph{Feedback levels.}
+\begin{itemize}
+  \item \textsc{score}: only $F_i$. This is exactly what a leaderboard returns, and the only level available when labels are hidden.
+  \item \textsc{errors}: which items failed, and the system's outputs on them.
+  \item \textsc{corrections}: errors plus reference answers.
+\end{itemize}
+An optional \emph{label budget} $B$ caps how many corrected errors are revealed per round.
+
+\paragraph{Improvement channels.}
+\begin{itemize}
+  \item \textsc{none}: a control arm; $\sigma_{i+1} = \sigma_i$.
+  \item \textsc{prompt}: instructions and notes change, weights are frozen (``recursive prompt improvement'').
+  \item \textsc{memory}: an external store of examples or tools grows.
+  \item \textsc{weights}: parameters change (``recursive learning improvement'').
+\end{itemize}
+A mechanism is \emph{self-authored} if $M$ itself writes the change, as in reflection or prompt rewriting, rather than a fixed procedure applying it.
+
+\paragraph{Definition (RSI, operational).} A system exhibits \emph{recursive self-improvement at level L$k$} on a benchmark, under channel $c$ and feedback level $\ell$, if its held-out trajectory $S_0,\dots,S_T$ satisfies the level-$k$ criterion of \S\ref{sec:levels}. Claims of RSI must state $(c, \ell, B, T)$.
+
+%-------------------------------------------------------------------------------
+\section{Metrics}
+\label{sec:metrics}
+
+\paragraph{Curve metrics.} With step gains $\eta_i = S_i - S_{i-1}$:
+\begin{align*}
+\eta &= \tfrac{1}{T}(S_T - S_0) && \text{(headline RSI rate)}\\
+g &= \frac{S_T - S_0}{1 - S_0} && \text{(normalized gain; share of headroom closed)}\\
+\text{mono} &= \tfrac{1}{T}\textstyle\sum_i \mathbb{1}[\eta_i > 0] && \text{(monotonicity)}\\
+\text{acc} &= \operatorname{mean}_i (\eta_i - \eta_{i-1}) && \text{(acceleration)}\\
+\text{AUIC} &= \tfrac{1}{T}\textstyle\sum_{i\ge1}(S_i - S_0) && \text{(area under improvement curve)}
+\end{align*}
+The normalized gain follows \citet{hake1998}. We also fit $S_i \approx S_\infty - (S_\infty - S_0)e^{-ki}$ by grid search over $k$, with $S_\infty$ in closed form. This reports a predicted ceiling $S_\infty$ and rate $k$. Negative acceleration with a good saturating fit is ordinary diminishing returns; positive acceleration is the signature of improvement that compounds.
+
+\paragraph{Integrity metrics.}
+\begin{itemize}
+  \item \emph{Generalisation gap}, $\text{GenGap} = (F_T - F_0) - (S_T - S_0)$, measures how much of the apparent gain is memorisation of fed-back items.
+  \item \emph{Forgetting} is the worst per-round fraction of solved held-out items that regress \citep[cf.][]{kirkpatrick2017}.
+  \item \emph{Alignment drift}, $\text{Align}\Delta = A_T - A_0$, is the change on the alignment track.
+  \item \emph{Gain vs.\ control} subtracts the \textsc{none} arm's gain, which absorbs sampling noise and provider drift.
+\end{itemize}
+
+\paragraph{RSI levels.}
+\label{sec:levels}
+We test $S_T$ against $S_0$ with a paired bootstrap 95\% CI over held-out items \citep{efron1979} and an exact two-sided sign test on items that changed ($\alpha=0.05$):
+\begin{itemize}
+  \item[\textbf{L0}] \textbf{None}: the gain is not significant.
+  \item[\textbf{L1}] \textbf{One-shot}: significant, but $S_T - S_1 \le \epsilon$; all the gain arrives in the first round.
+  \item[\textbf{L2}] \textbf{Sustained}: significant, and still improving after round 1.
+  \item[\textbf{L3}] \textbf{Accelerating}: L2 with acceleration $>0$ and monotonicity $\ge 0.5$.
+\end{itemize}
+For hidden-label (aggregate-only) benchmarks, the significance test falls back to a threshold on $S_T - S_0$. The leaderboard ranks by level, then $\eta$, then smaller GenGap.
+
+%-------------------------------------------------------------------------------
+\section{The Benchmark}
+\label{sec:bench}
+
+\paragraph{Core suites (v0).} Four synthetic, fully machine-checkable suites, each chosen to isolate a different kind of improvement:
+\begin{itemize}
+  \item \texttt{cipher}: a hidden letter-substitution rule. Corrections reveal parts of the rule, so transfer to held-out words is proportional to letter coverage.
+  \item \texttt{arithmetic}: integer arithmetic, where a latent skill may be unlocked by a single demonstration.
+  \item \texttt{lookup}: arbitrary key$\to$code facts. Held-out items \emph{cannot} improve, which makes this suite the control for the generalisation gap.
+  \item \texttt{instruction}: the \textbf{alignment track}. Developer-intent constraints such as ``all caps'', ``at most 3 words'', ``end with OVER'' and ``mention anote'' are scored by verifiable checks with partial credit.
+\end{itemize}
+Each suite contributes 40 tasks by default, split 50/50 into feedback and held-out.
+
+\paragraph{Planned suites (v1).}
+\begin{itemize}
+  \item Frontier reasoning: post-cutoff or generated items, so that the ceiling is far away.
+  \item Code with executable feedback.
+  \item Short-horizon agentic tasks with verifiable end states.
+  \item A richer developer-intent set.
+  \item Regulation and compliance items.
+  \item Every public dataset on the Anote Model Leaderboard, via score-only feedback (\S\ref{sec:harness}).
+\end{itemize}
+Items that no system solves at any iteration form a published \emph{frontier list}, the list of ``tasks we cannot do yet''.
+
+%-------------------------------------------------------------------------------
+\section{Harness and Leaderboard Integration}
+\label{sec:harness}
+
+The reference implementation is a stdlib-only Python package. Its components are:
+\begin{itemize}
+  \item Task and benchmark types with stratified splits.
+  \item A runner that records per-item, per-suite and per-track scores at every iteration, along with state size and model-call counts as cost proxies.
+  \item Six mechanisms: \texttt{none}, \texttt{score\_feedback}, \texttt{fewshot\_accumulation}, \texttt{self\_reflection}, \texttt{prompt\_rewrite} and \texttt{weight\_update}. The last applies to any model that implements \texttt{train}.
+  \item Provider adapters for Anthropic, OpenAI, Google, Ollama, and arbitrary callables.
+\end{itemize}
+The runner refuses to pair a mechanism with a weaker feedback level than it declares, and refuses item-level feedback on aggregate-only benchmarks.
+
+\paragraph{Anote Model Leaderboard.} The Leaderboard exposes public dataset inputs (\texttt{GET /public/dataset\_questions}) and scores private submissions server-side (\texttt{POST /public/submit\_model}), returning an aggregate metric. RSI-Bench wraps any such dataset as a benchmark whose \texttt{evaluate} submits the split's predictions and reads back the score. Labels never leave the server, so the only admissible feedback is \textsc{score}: the ``feed the cumulative scores back to the model'' setting. Trajectories are published back as one curated row per iteration.
+
+We ran this loop end-to-end against a local Leaderboard backend on its SST-2 sample dataset. This surfaced two operational constraints that any leaderboard-backed RSI evaluation must budget for:
+\begin{itemize}
+  \item A run consumes $2(T+1)$ submissions, which collides with per-submitter daily quotas (default 5).
+  \item Per-minute rate limits (default 10) require throttling.
+\end{itemize}
+It also showed that answer formats must be communicated explicitly: here the labels were integers, while natural-language labels scored 0. Score-only feedback is therefore not free. On real leaderboards, the feedback budget is a policy decision of the leaderboard operator.
+
+%-------------------------------------------------------------------------------
+\section{Harness Validation}
+\label{sec:validation}
+
+Before measuring real systems, we check that the metrics recover known behaviour. \texttt{SimulatedLearner} is a deterministic learner with explicit rules:
+\begin{itemize}
+  \item It induces cipher letters from corrected pairs or from \texttt{MAP} notes.
+  \item It unlocks multiplication from one demonstration.
+  \item It stores lookup facts verbatim.
+  \item It learns an instruction tag from one demonstration, \emph{or} from seeing its own failure, so errors without references suffice.
+  \item It cannot learn from a scalar.
+  \item It reads only the first 6{,}000 characters of context.
+\end{itemize}
+It is \emph{not} a model of any LLM. Setup: 80 feedback and 80 held-out tasks, $T{=}8$, budget $B{=}10$ corrections per round, 2\% answer noise, seed 0. Results are regenerated in CI and compared byte-for-byte.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{lllrrrrrl}
+\toprule
+Mechanism & Channel & Feedback & $S_0$ & $S_T$ & $\eta$ & GenGap & Forget & Level \\
+\midrule
+self\_reflection & prompt & corrections & .163 & .675 & +.064 & +.312 & .055 & L2 \\
+prompt\_rewrite & prompt & corrections & .163 & .675 & +.064 & +.312 & .055 & L2 \\
+weight\_update & weights & corrections & .163 & .675 & +.064 & +.312 & .055 & L2 \\
+fewshot\_accum. & memory & corrections & .163 & .625 & +.058 & +.213 & .316 & L2 \\
+score\_feedback & prompt & score & .163 & .163 & +.000 & +.000 & .077 & L0 \\
+none (control) & none & score & .163 & .163 & +.000 & +.000 & .077 & L0 \\
+\bottomrule
+\end{tabular}
+\caption{Harness validation with a deterministic reference learner (not a real model). Forget for the control reflects the 2\% injected noise.}
+\label{tab:main}
+\end{table}
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}
+\begin{axis}[width=0.8\linewidth,height=5.5cm,xlabel={Iteration $i$},ylabel={Held-out score $S_i$},
+  ymin=0.1,ymax=0.75,xtick={0,...,8},legend pos=south east,legend style={font=\small},grid=major]
+\addplot+[mark=*] coordinates {(0,.163)(1,.338)(2,.525)(3,.662)(4,.688)(5,.688)(6,.662)(7,.675)(8,.675)};
+\addlegendentry{self\_reflection / prompt\_rewrite / weight\_update}
+\addplot+[mark=square*] coordinates {(0,.163)(1,.338)(2,.525)(3,.662)(4,.475)(5,.463)(6,.562)(7,.537)(8,.625)};
+\addlegendentry{fewshot\_accumulation}
+\addplot+[mark=triangle*] coordinates {(0,.163)(1,.163)(2,.150)(3,.163)(4,.150)(5,.163)(6,.150)(7,.150)(8,.163)};
+\addlegendentry{none / score\_feedback}
+\end{axis}
+\end{tikzpicture}
+\caption{Held-out trajectories in the validation study. Few-shot accumulation evicts its oldest examples once it holds 32. It loses the multiplication demonstration and part of the cipher at $i{=}4$, which the forgetting metric flags (0.316).}
+\label{fig:curves}
+\end{figure}
+
+\paragraph{Findings.} Table~\ref{tab:main} and Figure~\ref{fig:curves} show that each metric responds to the behaviour it was designed for:
+\begin{enumerate}
+  \item \textbf{Score-only feedback.} A learner that cannot use scalars gets $\eta = 0$ under \textsc{score} feedback, and its gain vs.\ control is exactly zero. RSI-Bench does not manufacture improvement from noise.
+  \item \textbf{Information-equivalent channels.} Prompt, self-authored and weight channels that deliver the same information produce \emph{identical} curves. Differences between channels on real models can therefore be attributed to the model, not the harness.
+  \item \textbf{Forgetting.} Context eviction appears as a non-monotone curve and as forgetting of .316, versus .055.
+  \item \textbf{Memorisation.} The \texttt{lookup} suite improves only on the feedback split. It contributes to a positive GenGap, and it remains on the frontier list with the uncovered cipher letters (24 held-out items never solved).
+  \item \textbf{Feedback richness.} With \textsc{errors} instead of \textsc{corrections}, self-reflection reaches $S_T = .412$ ($\eta=+.031$). All of the gain is on the alignment suite and GenGap is 0: the learner can fix constraint violations by rereading its instructions, but cannot infer an unseen cipher.
+  \item \textbf{Label budget.} With $B{=}2$, weight updates reach $S_T=.463$ (L2). With an unlimited budget, all gain arrives in round 1 and the run is classified L1. RSI level is therefore a property of the (system, budget) pair, and must be reported with it.
+  \item \textbf{Alignment track.} It moves independently of capability (Align$\Delta=+1.0$ here). This is the property needed to detect drift in Experiment~5.
+\end{enumerate}
+
+%-------------------------------------------------------------------------------
+\section{Pre-registered Protocol for Frontier Models}
+\label{sec:protocol}
+
+We pre-register the following sweep; results will be reported in a subsequent version.
+\begin{description}
+  \item[Models.] Frontier closed models (Claude, GPT, Gemini, Grok families) and open-weights models (Llama, Mistral, Qwen) via Ollama.
+  \item[Arms.] Mechanisms \texttt{none}, \texttt{score\_feedback}, \texttt{self\_reflection}, \texttt{prompt\_rewrite}, \texttt{fewshot\_accumulation}; for open models also LoRA \texttt{weight\_update}.
+  \item[Settings.] Feedback $\in$ \{score, errors, corrections\}; $B \in \{2, 10, \infty\}$; $T{=}8$ (and $T{=}20$ for the acceleration study); 3 seeds.
+\end{description}
+
+\paragraph{Hypotheses.}
+\begin{itemize}
+  \item H1: frontier models reach L1--L2 via prompt channels on the core suites; none reach L3 at $T{=}8$.
+  \item H2: score-only feedback yields $\eta \approx 0$ for item-level tasks.
+  \item H3: self-authored prompt channels generalise better per context token than raw few-shot accumulation.
+  \item H4: naive retest-on-feedback protocols overstate improvement by GenGap.
+  \item H5: \texttt{prompt\_rewrite} produces negative Align$\Delta$ for some models when capability errors dominate the feedback.
+  \item H6: long-horizon curves are well fit by a saturating exponential.
+\end{itemize}
+An L3 result on any frontier suite would warrant manual review before publication.
+
+%-------------------------------------------------------------------------------
+\section{Implications for Governance}
+
+RSI levels are discrete, reproducible and statistically gated, and they are reported together with alignment drift. This makes them usable as \emph{reporting} signals in capability-threshold regimes: a developer can state ``model X is L1 under prompt/corrections/$B{=}10$ on RSI-Bench v1, Align$\Delta$ within $\pm 0.02$''. Two properties matter for this use:
+\begin{itemize}
+  \item The channel/feedback declaration makes clear \emph{what resources} produced the improvement.
+  \item The held-out split and GenGap make gaming by memorisation visible.
+\end{itemize}
+We do not claim that RSI-Bench detects open-ended, real-world self-improvement. It measures a well-defined, bounded proxy.
+
+%-------------------------------------------------------------------------------
+\section{Limitations}
+
+\begin{itemize}
+  \item The v0 suites are synthetic and easy to saturate. They are a harness, not a frontier measurement.
+  \item Mechanism quality confounds model quality, so we report per mechanism and invite mechanism submissions as a separate track.
+  \item Hosted models are non-deterministic and change silently, so the control arm is mandatory.
+  \item Held-out contamination is a standing risk, mitigated by rotation and post-cutoff items.
+  \item Our alignment track is a narrow proxy for developer intent.
+  \item The validation study uses a deterministic toy learner. It establishes that the metrics are correct, not how real systems behave.
+\end{itemize}
+
+\section{Conclusion}
+
+RSI-Bench turns ``is this system recursively self-improving?'' into a measurement: a held-out trajectory, a declared channel and feedback level, a small set of interpretable metrics, and a discrete level. The harness is open and runs any API-accessible model. Through the Anote Model Leaderboard, any public dataset becomes an RSI dataset. We invite labs and the community to submit systems and mechanisms.
+
+\bibliographystyle{plainnat}
+\bibliography{references}
+
+\end{document}
