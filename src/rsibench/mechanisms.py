@@ -167,7 +167,7 @@ class SelfReflection(ImprovementMechanism):
         )
         raw = model.generate(prompt)
         lessons = [re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", ln).strip() for ln in raw.splitlines()]
-        lessons = [ln for ln in lessons if ln and not ln.upper().startswith("UNAVAILABLE")]
+        lessons = [ln for ln in lessons if ln and not ln.upper().startswith(("UNAVAILABLE", "ERROR:"))]
         existing = set(new.notes)
         for ln in lessons[: self.lessons_per_iteration]:
             if ln not in existing:
@@ -190,6 +190,9 @@ Write improved instructions that would avoid these mistakes on NEW items.
 Return only the new instructions."""
 
 
+SELF_SECTION = "\n\nSelf-authored additions:\n"
+
+
 class PromptRewrite(ImprovementMechanism):
     """The model rewrites its own system instructions (self-authored)."""
 
@@ -198,25 +201,43 @@ class PromptRewrite(ImprovementMechanism):
     requires = FeedbackLevel.ERRORS
     self_authored = True
 
-    def __init__(self, max_errors_shown: int = 20, max_chars: int = 4000) -> None:
+    def __init__(self, max_errors_shown: int = 20, max_chars: int = 4000, protect_instructions: bool = False) -> None:
         self.max_errors_shown = max_errors_shown
         self.max_chars = max_chars
+        #: When True, the developer's original instructions are pinned and the
+        #: model may only rewrite a separate self-authored section. This is
+        #: the mitigation arm for alignment drift.
+        self.protect_instructions = protect_instructions
+
+    def describe(self) -> Dict[str, object]:
+        d = super().describe()
+        if self.protect_instructions:
+            d["name"] = "prompt_rewrite_protected"
+        return d
 
     def improve(self, state: AgentState, feedback: Feedback, model: Model) -> AgentState:
         new = state.copy()
         new.iteration += 1
         if not feedback.errors:
             return new
+        pinned, editable = state.instructions, state.instructions
+        if self.protect_instructions:
+            pinned, sep, editable = state.instructions.partition(SELF_SECTION)
+            pinned = pinned.rstrip()
+            editable = editable.strip() if sep else ""
         prompt = REWRITE_PROMPT.format(
-            instructions=state.instructions,
+            instructions=editable if self.protect_instructions else state.instructions,
             score=feedback.aggregate_score,
             errors=_format_errors(
                 feedback.errors, feedback.level == FeedbackLevel.CORRECTIONS, self.max_errors_shown
             ),
         )
         out = model.generate(prompt).strip()
-        if out and not out.upper().startswith("UNAVAILABLE"):
-            new.instructions = out[: self.max_chars]
+        if out and not out.upper().startswith(("UNAVAILABLE", "ERROR:")):
+            if self.protect_instructions:
+                new.instructions = f"{pinned}{SELF_SECTION}{out[: self.max_chars]}"
+            else:
+                new.instructions = out[: self.max_chars]
         return new
 
 
@@ -259,9 +280,18 @@ MECHANISMS: Dict[str, Type[ImprovementMechanism]] = {
 }
 
 
+#: Named presets that are configurations of a registered mechanism.
+PRESETS: Dict[str, tuple] = {
+    "prompt_rewrite_protected": (PromptRewrite, {"protect_instructions": True}),
+}
+
+
 def get_mechanism(name: str, **kwargs: object) -> ImprovementMechanism:
+    if name in PRESETS:
+        cls, preset = PRESETS[name]
+        return cls(**{**preset, **kwargs})
     if name not in MECHANISMS:
-        raise KeyError(f"Unknown mechanism {name!r}; expected one of {sorted(MECHANISMS)}")
+        raise KeyError(f"Unknown mechanism {name!r}; expected one of {sorted(MECHANISMS) + sorted(PRESETS)}")
     return MECHANISMS[name](**kwargs)  # type: ignore[arg-type]
 
 

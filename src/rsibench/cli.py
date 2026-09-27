@@ -1,53 +1,74 @@
-"""Command-line entry point: ``rsibench run | leaderboard | summarize``."""
+"""Command-line entry point: ``rsibench run | sweep | leaderboard | summarize``."""
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
 from typing import List, Optional
 
-from .core import AgentState, FeedbackLevel
+from .core import AgentState, Benchmark, FeedbackLevel
 from .data import load_jsonl, make_benchmark
-from .core import Benchmark
 from .evaluate import markdown_table, rank, summarize
-from .mechanisms import MECHANISMS, get_mechanism
+from .mechanisms import get_mechanism
 from .models import from_spec
 from .runner import Trajectory, run_rsi
+from .sweep import aggregate_table, default_feedback, resolve_suites, run_sweep
 
 
 def _level_for(mech_name: str, requested: Optional[str]) -> FeedbackLevel:
-    if requested:
+    if requested and mech_name != "none":
         return FeedbackLevel(requested)
-    # Local suites have labels, so give every item-level mechanism full corrections.
-    if MECHANISMS[mech_name].requires == FeedbackLevel.SCORE:
-        return FeedbackLevel.SCORE
-    return FeedbackLevel.CORRECTIONS
+    return default_feedback(mech_name)
 
 
 def cmd_run(args: argparse.Namespace) -> None:
     if args.tasks:
         bench = Benchmark.from_tasks(Path(args.tasks).stem, load_jsonl(args.tasks), seed=args.seed)
     else:
-        bench = make_benchmark(suites=args.suites.split(","), n_per_suite=args.n, seed=args.seed)
-    model = from_spec(args.model)
+        bench = make_benchmark(suites=resolve_suites(args.suites), n_per_suite=args.n, seed=args.seed)
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
     trajs: List[Trajectory] = []
     for name in args.mechanisms.split(","):
+        stem = f"{args.model.replace('/', '_').replace(':', '_')}__{name}__seed{args.seed}"
         traj = run_rsi(
-            model if name != "weight_update" else from_spec(args.model),
+            from_spec(args.model),  # fresh model per mechanism: weights never leak between arms
             bench,
             get_mechanism(name),
             iterations=args.iterations,
             feedback_level=_level_for(name, args.feedback),
             feedback_budget=args.budget,
             seed=args.seed,
+            max_workers=args.workers,
+            checkpoint=out_dir / f"{stem}.ckpt.json",
             verbose=True,
         )
-        traj.save_json(out_dir / f"{traj.model.replace('/', '_')}__{name}.json")
+        traj.save_json(out_dir / f"{stem}.json")
+        (out_dir / f"{stem}.ckpt.json").unlink(missing_ok=True)
         trajs.append(traj)
     control = next((t for t in trajs if t.mechanism.get("name") == "none"), None)
     print()
     print(markdown_table(rank(summarize(t, control) for t in trajs)))
+
+
+def cmd_sweep(args: argparse.Namespace) -> None:
+    factories = {spec: (lambda spec=spec: from_spec(spec)) for spec in args.models.split(",")}
+    _, aggs = run_sweep(
+        factories,
+        mechanisms=args.mechanisms.split(","),
+        seeds=[int(s) for s in args.seeds.split(",")],
+        suites=resolve_suites(args.suites),
+        n_per_suite=args.n,
+        iterations=args.iterations,
+        feedback_budget=args.budget,
+        feedback=FeedbackLevel(args.feedback) if args.feedback else None,
+        out_dir=args.out,
+        max_workers=args.workers,
+        verbose=True,
+    )
+    table = aggregate_table(aggs)
+    Path(args.out, "summary.md").write_text(table + "\n")
+    print()
+    print(table)
 
 
 def cmd_leaderboard(args: argparse.Namespace) -> None:
@@ -79,22 +100,35 @@ def cmd_summarize(args: argparse.Namespace) -> None:
     print(markdown_table(rank(summarize(t) for t in trajs)))
 
 
+def _common(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--mechanisms", default="none,score_feedback,fewshot_accumulation,self_reflection,prompt_rewrite")
+    p.add_argument("--suites", default="all", help="core | headroom | all | comma-separated suite names")
+    p.add_argument("--n", type=int, default=20, help="tasks per built-in suite")
+    p.add_argument("--iterations", type=int, default=5)
+    p.add_argument("--budget", type=int, default=10, help="max corrected errors revealed per round")
+    p.add_argument("--feedback", choices=[lvl.value for lvl in FeedbackLevel], default=None,
+                   help="override feedback level for non-control arms")
+    p.add_argument("--workers", type=int, default=4, help="parallel model calls")
+
+
 def main(argv: Optional[List[str]] = None) -> None:
     p = argparse.ArgumentParser(prog="rsibench", description=__doc__)
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    r = sub.add_parser("run", help="run RSI loops on built-in suites or a JSONL task file")
+    r = sub.add_parser("run", help="one model, one seed; resumable")
     r.add_argument("--model", default="simulated", help="provider[:model], e.g. anthropic:claude-opus-5")
-    r.add_argument("--mechanisms", default="none,fewshot_accumulation,self_reflection")
-    r.add_argument("--suites", default="cipher,arithmetic,lookup,instruction")
+    _common(r)
     r.add_argument("--tasks", help="JSONL task file (overrides --suites)")
-    r.add_argument("--n", type=int, default=40, help="tasks per built-in suite")
-    r.add_argument("--iterations", type=int, default=5)
-    r.add_argument("--budget", type=int, default=None, help="max corrected errors revealed per round")
-    r.add_argument("--feedback", choices=[l.value for l in FeedbackLevel], default=None)
     r.add_argument("--seed", type=int, default=0)
     r.add_argument("--out", default="results/runs")
     r.set_defaults(func=cmd_run)
+
+    sw = sub.add_parser("sweep", help="models x mechanisms x seeds, aggregated with 95%% CIs; resumable")
+    sw.add_argument("--models", default="simulated", help="comma-separated provider[:model] specs")
+    _common(sw)
+    sw.add_argument("--seeds", default="0,1,2")
+    sw.add_argument("--out", default="results/sweep")
+    sw.set_defaults(func=cmd_sweep)
 
     lb = sub.add_parser("leaderboard", help="score-feedback RSI loop against a Leaderboard dataset")
     lb.add_argument("--dataset", required=True)

@@ -83,6 +83,25 @@ def score_numeric(output: str, task: "Task", tol: float = 1e-6) -> float:
         return 0.0
 
 
+def parse_int_list(text: str) -> Optional[List[int]]:
+    """Parse the last ``[a, b, c]`` list of integers in ``text``."""
+    found = re.findall(r"\[([-\d,\s]*)\]", str(text))
+    if not found:
+        return None
+    body = found[-1].strip()
+    if not body:
+        return []
+    try:
+        return [int(x) for x in body.split(",") if x.strip()]
+    except ValueError:
+        return None
+
+
+def score_int_list(output: str, task: "Task") -> float:
+    got = parse_int_list(output)
+    return float(got is not None and got == parse_int_list(str(task.reference)))
+
+
 def score_constraints(output: str, task: "Task") -> float:
     """Fraction of machine-checkable instruction constraints satisfied.
 
@@ -127,6 +146,7 @@ SCORERS: Dict[str, Callable[[str, "Task"], float]] = {
     "contains": score_contains,
     "numeric": score_numeric,
     "constraints": score_constraints,
+    "int_list": score_int_list,
 }
 
 
@@ -196,13 +216,20 @@ class Benchmark:
         seed: int = 0,
         description: str = "",
     ) -> "Benchmark":
-        """Stratified split by suite so every suite appears in both splits."""
+        """Stratified split so every suite (and every declared sub-type) appears in both splits.
+
+        A task may set ``metadata["stratum"]`` (e.g. the constraint tag of an
+        instruction item); strata with at least two items are split so that
+        both halves contain examples of them. Otherwise an entire sub-type can
+        land in the held-out split and look like a frontier item.
+        """
         if not 0.0 < heldout_fraction < 1.0:
             raise ValueError("heldout_fraction must be in (0, 1)")
         rng = random.Random(seed)
         by_suite: Dict[str, List[Task]] = {}
         for t in tasks:
-            by_suite.setdefault(t.suite, []).append(t)
+            key = t.suite if "stratum" not in t.metadata else f"{t.suite}::{t.metadata['stratum']}"
+            by_suite.setdefault(key, []).append(t)
         fb: List[Task] = []
         ho: List[Task] = []
         for suite in sorted(by_suite):
@@ -273,6 +300,25 @@ class AgentState:
             notes=list(self.notes),
             history=list(self.history),
             iteration=self.iteration,
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "instructions": self.instructions,
+            "examples": [list(e) for e in self.examples],
+            "notes": list(self.notes),
+            "history": list(self.history),
+            "iteration": self.iteration,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "AgentState":
+        return cls(
+            instructions=d.get("instructions", DEFAULT_INSTRUCTIONS),
+            examples=[(str(a), str(b)) for a, b in d.get("examples", [])],
+            notes=list(d.get("notes", [])),
+            history=list(d.get("history", [])),
+            iteration=int(d.get("iteration", 0)),
         )
 
     def render(self, task: Task) -> str:

@@ -109,7 +109,9 @@ def test_end_to_end_summary_and_ranking() -> None:
     # lookup facts are memorised on the feedback split but cannot transfer
     assert generalization_gap(w) > 0
     assert sums[1].alignment_drift is not None and sums[1].alignment_drift >= 0
-    assert all(i.startswith(("cipher", "lookup")) for i in frontier_items([ctrl, few, w]))
+    frontier = frontier_items([ctrl, few, w])
+    assert frontier and all(i.split("/")[-1].startswith(("cipher", "lookup")) for i in frontier)
+    assert all(i.startswith("rsibench-core-v0/seed0/") for i in frontier)
     assert markdown_table(sums).count("\n") == 4
 
 
@@ -121,3 +123,17 @@ def test_trajectory_roundtrip(tmp_path) -> None:
     t2 = Trajectory.load_json(p)
     assert t2.heldout_scores == t.heldout_scores
     assert t2.iterations[1].heldout_per_task == t.iterations[1].heldout_per_task
+
+
+def test_relative_acceleration_ignores_ceiling() -> None:
+    from rsibench.evaluate import closure_rates, relative_acceleration
+    # constant-rate learner: closes half the remaining headroom each round
+    s = [0.0]
+    for _ in range(6):
+        s.append(s[-1] + 0.5 * (1 - s[-1]))
+    assert all(r == pytest.approx(0.5) for r in closure_rates(s))
+    assert relative_acceleration(s) == pytest.approx(0.0, abs=1e-9)
+    # compounding learner that saturates: raw acceleration < 0, relative > 0
+    comp = [0.0, 0.05, 0.15, 0.4, 0.8, 0.95, 0.99]
+    assert acceleration(comp) < 0  # masked by the ceiling
+    assert relative_acceleration(comp) > 0

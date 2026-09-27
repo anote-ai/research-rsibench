@@ -19,4 +19,4 @@ jobs:
       - name: Run tests
         run: pytest tests/ -v
       - name: Reproduce harness-validation results
-        run: python scripts/run_demo.py > /dev/null && git diff --exit-code results/sim_results.md
+        run: python scripts/run_demo.py > /dev/null && git diff --exit-code results/validation.md

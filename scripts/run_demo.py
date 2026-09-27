@@ -1,145 +1,150 @@
 #!/usr/bin/env python3
-"""Reproduce the harness-validation results in the paper (no API keys needed).
+"""Experiment 0: harness validation. Reproduces every table in results/validation.md.
 
-Runs every improvement mechanism against the deterministic SimulatedLearner on
-the four core suites and writes:
-
-  results/sim_trajectories.json   full per-iteration, per-item trajectories
-  results/sim_results.md          summary tables (main grid + ablations)
+Every metric RSI-Bench reports is checked against a deterministic reference
+learner (``SimulatedLearner``) whose learning rules are known, so each metric
+has a known right answer. No API keys are needed. The numbers say nothing
+about real models.
 """
 from __future__ import annotations
 
 import json
 import os
 import sys
+from typing import Dict, List
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from rsibench import (  # noqa: E402
-    FeedbackLevel,
-    SimulatedLearner,
-    frontier_items,
-    get_mechanism,
-    make_benchmark,
-    markdown_table,
-    rank,
-    run_rsi,
-    summarize,
-)
+from rsibench import FeedbackLevel, SimulatedLearner, frontier_items  # noqa: E402
+from rsibench.core import DEFAULT_INSTRUCTIONS, AgentState  # noqa: E402
+from rsibench.data import ALL_SUITES, CORE_SUITES, HEADROOM_SUITES  # noqa: E402
+from rsibench.models import DEVELOPER_POLICY_PHRASE  # noqa: E402
+from rsibench.sweep import aggregate_table, run_sweep  # noqa: E402
 
-ITERATIONS = 8
+SEEDS = (0, 1, 2, 3, 4)
+ITERATIONS = 6
+N = 20
 BUDGET = 10
-SEED = 0
 ROOT = os.path.join(os.path.dirname(__file__), "..")
 
 
+def sim(**kw):
+    return lambda: SimulatedLearner(noise=0.02, **kw)
+
+
 def main() -> None:
-    bench = make_benchmark(n_per_suite=40, seed=SEED)
-    print(f"benchmark {bench.name}: {len(bench.feedback)} feedback / {len(bench.heldout)} held-out tasks")
+    common = dict(seeds=SEEDS, n_per_suite=N, iterations=ITERATIONS, feedback_budget=BUDGET)
+    sections: Dict[str, str] = {}
 
-    grid = [
-        ("none", FeedbackLevel.SCORE),
-        ("score_feedback", FeedbackLevel.SCORE),
-        ("fewshot_accumulation", FeedbackLevel.CORRECTIONS),
-        ("self_reflection", FeedbackLevel.CORRECTIONS),
-        ("prompt_rewrite", FeedbackLevel.CORRECTIONS),
-        ("weight_update", FeedbackLevel.CORRECTIONS),
-    ]
-    trajs = {}
-    for name, level in grid:
-        model = SimulatedLearner(noise=0.02, seed=SEED)  # fresh model: weights are per-run
-        trajs[name] = run_rsi(model, bench, get_mechanism(name), iterations=ITERATIONS,
-                              feedback_level=level, feedback_budget=BUDGET, seed=SEED)
-    control = trajs["none"]
-    main_rows = rank(summarize(t, control) for t in trajs.values())
+    # A. Main grid on all suites.
+    trajs, aggs = run_sweep(
+        {"sim": sim()},
+        ["score_feedback", "fewshot_accumulation", "self_reflection", "prompt_rewrite",
+         "prompt_rewrite_protected", "weight_update"],
+        suites=ALL_SUITES, **common)
+    sections["A"] = aggregate_table(aggs)
+    seed0 = [t for t in trajs if t.config["seed"] == 0]
+    suites = list(ALL_SUITES)
+    per_suite_rows = []
+    for t in seed0:
+        cells = [f"{t.iterations[0].heldout_by_suite[s]:.2f}→{t.iterations[-1].heldout_by_suite[s]:.2f}" for s in suites]
+        per_suite_rows.append(f"| {t.mechanism['name']} | " + " | ".join(cells) + " |")
+    sections["A_suites"] = (f"| Mechanism | {' | '.join(suites)} |\n|---|{'---|' * len(suites)}\n"
+                            + "\n".join(per_suite_rows))
+    frontier = frontier_items(trajs)
+    fr_suites = sorted({f.rsplit("/", 1)[-1].rsplit("-", 1)[0] for f in frontier})
 
-    # Ablation A: feedback richness for self-reflection
-    abl_fb = []
-    for level in (FeedbackLevel.ERRORS, FeedbackLevel.CORRECTIONS):
-        t = run_rsi(SimulatedLearner(noise=0.02, seed=SEED), bench, get_mechanism("self_reflection"),
-                    iterations=ITERATIONS, feedback_level=level, feedback_budget=BUDGET, seed=SEED)
-        abl_fb.append(summarize(t, control))
+    # B. Recursive (accelerating) improvement: a learner whose absorption capacity
+    #    doubles after every weight update ("learning to learn").
+    _, aggs_b = run_sweep(
+        {"sim": sim(), "sim-meta": sim(name="sim-metalearner", train_capacity=1, capacity_growth=2.0)},
+        ["weight_update"], suites=ALL_SUITES, **{**common, "feedback_budget": 40})
+    sections["B"] = aggregate_table([a for a in aggs_b if a.mechanism != "none"])
 
-    # Ablation B: context window for few-shot accumulation
-    abl_ctx = []
-    for chars in (1500, 6000, 50000):
-        t = run_rsi(SimulatedLearner(name=f"sim-ctx{chars}", context_chars=chars, noise=0.02, seed=SEED),
-                    bench, get_mechanism("fewshot_accumulation", max_examples=200), iterations=ITERATIONS,
-                    feedback_level=FeedbackLevel.CORRECTIONS, feedback_budget=BUDGET, seed=SEED)
-        abl_ctx.append(summarize(t, control))
+    # C. Alignment drift: the developer's system prompt grants the format-tag
+    #    policy. A learner whose self-rewrite drops developer text vs. one that
+    #    keeps it, with and without pinned (protected) instructions.
+    dev = AgentState(instructions=f"{DEFAULT_INSTRUCTIONS}\n{DEVELOPER_POLICY_PHRASE}")
+    drift_suites = CORE_SUITES + ("operator", "listfn")  # alignment track = explicit instructions only
+    _, aggs_c = run_sweep(
+        {"sim": sim(), "sim-drop": sim(name="sim-drops-dev-prompt", rewrite_keeps_instructions=False)},
+        ["prompt_rewrite", "prompt_rewrite_protected"], suites=drift_suites, initial_state=dev, **common)
+    sections["C"] = aggregate_table([a for a in aggs_c if a.mechanism != "none"])
 
-    # Ablation C: feedback budget for weight updates
-    abl_budget = []
+    # D. Feedback richness.
+    _, aggs_d = run_sweep({"sim": sim()}, ["self_reflection"], suites=ALL_SUITES,
+                          feedback=FeedbackLevel.ERRORS, **common)
+    d_rows = [a for a in aggs_d if a.mechanism != "none"] + [a for a in aggs if a.mechanism == "self_reflection"]
+    sections["D"] = aggregate_table(d_rows)
+
+    # E. Label budget per round.
+    e_rows: List = []
     for budget in (2, 10, None):
-        t = run_rsi(SimulatedLearner(name=f"sim-budget{budget or 'all'}", noise=0.02, seed=SEED), bench,
-                    get_mechanism("weight_update"), iterations=ITERATIONS,
-                    feedback_level=FeedbackLevel.CORRECTIONS, feedback_budget=budget, seed=SEED)
-        abl_budget.append(summarize(t, control))
+        _, ag = run_sweep({f"b{budget}": sim(name=f"sim-budget-{budget or 'all'}")}, ["weight_update"],
+                          suites=ALL_SUITES, **{**common, "feedback_budget": budget})
+        e_rows += [a for a in ag if a.mechanism != "none"]
+    sections["E"] = aggregate_table(e_rows)
 
-    curves = "\n".join(
-        f"| {n} | " + " | ".join(f"{s:.3f}" for s in t.heldout_scores) + " |" for n, t in trajs.items()
-    )
-    header = "| Mechanism | " + " | ".join(f"I={i}" for i in range(ITERATIONS + 1)) + " |"
-    sep = "|---|" + "---|" * (ITERATIONS + 1)
-    suites = sorted(trajs["none"].iterations[0].heldout_by_suite)
-    suite_rows = "\n".join(
-        f"| {n} | " + " | ".join(
-            f"{t.iterations[0].heldout_by_suite[s]:.2f} → {t.iterations[-1].heldout_by_suite[s]:.2f}" for s in suites
-        ) + " |"
-        for n, t in trajs.items()
-    )
-    frontier = frontier_items(list(trajs.values()))
+    md = f"""# RSI-Bench validation study (Experiment 0)
 
-    md = f"""# RSI-Bench harness validation (SimulatedLearner)
+Every table is regenerated by `python scripts/run_demo.py` and checked in CI.
+The system under test is `SimulatedLearner`, a deterministic toy learner with
+known learning rules, **not a real model**. The purpose is to show that each
+RSI-Bench metric recovers a behaviour that is known to be present.
 
-These numbers validate the harness and metrics against a deterministic toy
-learner whose learning rules are known. They are **not** results about any
-real model. Reproduce with `python scripts/run_demo.py`.
+Setup: {len(SEEDS)} seeds (each seed redraws the split and the hidden rules),
+{N} tasks per suite, 50/50 feedback/held-out split, T = {ITERATIONS}, at most
+{BUDGET} corrected errors revealed per round unless stated, 2% answer noise.
+Cells are mean ± 95% CI across seeds. Levels are the modal level across seeds,
+with the vote count shown.
 
-Setup: {len(bench.feedback)} feedback / {len(bench.heldout)} held-out tasks, {ITERATIONS} iterations,
-at most {BUDGET} corrected errors revealed per round, 2% answer noise, seed {SEED}.
+Suites: core = {", ".join(CORE_SUITES)}; headroom = {", ".join(HEADROOM_SUITES)}.
 
-## Main grid (ranked)
+## A. Main grid (all suites)
 
-{markdown_table(main_rows)}
+{sections["A"]}
 
-Gain vs. no-improvement control: """ + ", ".join(
-        f"{s.mechanism} {s.gain_vs_control:+.3f}" for s in main_rows) + f"""
+Per-suite held-out score, seed 0 (I=0 → I={ITERATIONS}):
 
-## Held-out score trajectories
+{sections["A_suites"]}
 
-{header}
-{sep}
-{curves}
+Frontier: {len(frontier)} held-out items (suites: {", ".join(fr_suites) or "none"}) were never
+solved by any arm at any iteration of any seed.
 
-## Per-suite held-out score (I=0 → I={ITERATIONS})
+## B. Accelerating improvement (L3)
 
-| Mechanism | {" | ".join(suites)} |
-|---|{"---|" * len(suites)}
-{suite_rows}
+The meta-learner absorbs 1, 2, 4, 8, … corrections per weight update, so its
+improvement compounds. This is the behaviour the ACCELERATING level exists to detect.
 
-## Ablation A: feedback richness (self_reflection)
+{sections["B"]}
 
-{markdown_table(abl_fb)}
+## C. Alignment drift and its mitigation
 
-## Ablation B: context window (fewshot_accumulation, max 200 examples)
+The developer's system prompt contains a policy line that makes the learner
+follow format tags, so the alignment track starts at 1.0. `sim-drops-dev-prompt`
+throws away developer text whenever it rewrites its own prompt. Pinning the
+developer instructions (`prompt_rewrite_protected`) prevents that.
+**AlignWorst** is the largest dip below the baseline at any iteration. The
+endpoint **AlignΔ** can under-report the damage because the learner partly
+re-learns the tags from its own errors.
 
-{markdown_table(abl_ctx)}
+{sections["C"]}
 
-## Ablation C: label budget per round (weight_update)
+## D. Feedback richness (self_reflection)
 
-{markdown_table(abl_budget)}
+{sections["D"]}
 
-## Frontier
+## E. Label budget per round (weight_update)
 
-{len(frontier)} held-out items were never solved by any mechanism at any iteration
-(suites: {", ".join(sorted({f.split("-")[0] for f in frontier})) or "none"}).
+{sections["E"]}
 """
     os.makedirs(os.path.join(ROOT, "results"), exist_ok=True)
-    with open(os.path.join(ROOT, "results", "sim_results.md"), "w") as f:
+    with open(os.path.join(ROOT, "results", "validation.md"), "w") as f:
         f.write(md)
-    with open(os.path.join(ROOT, "results", "sim_trajectories.json"), "w") as f:
-        json.dump({n: t.to_dict() for n, t in trajs.items()}, f, indent=1)
+    with open(os.path.join(ROOT, "results", "validation_seed0_trajectories.json"), "w") as f:
+        json.dump({t.mechanism["name"]: {**t.to_dict(), "iterations": [
+            {k: v for k, v in it.items() if k != "elapsed_s"} for it in t.to_dict()["iterations"]]}
+            for t in seed0}, f, indent=1)
     print(md)
 
 

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rsibench"
-version = "0.1.0"
+version = "0.2.0"
 description = "Research package: an open benchmark for measuring recursive self-improvement (RSI) in AI systems"
 readme = "README.md"
 requires-python = ">=3.10"
