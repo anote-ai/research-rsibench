@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rsibench"
+version = "0.2.0"
+description = "Research package: an open benchmark for measuring recursive self-improvement (RSI) in AI systems"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+providers = ["anthropic", "openai", "google-generativeai", "python-dotenv"]
+report = ["rich", "matplotlib"]
+dev = ["pytest"]
+
+[project.scripts]
+rsibench = "rsibench.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

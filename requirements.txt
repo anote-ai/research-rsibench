@@ -1,0 +1,11 @@
+# Core package has no required dependencies (stdlib only).
+# Optional: model providers
+anthropic
+openai
+google-generativeai
+python-dotenv
+# Optional: reporting
+rich
+matplotlib
+# Dev
+pytest
